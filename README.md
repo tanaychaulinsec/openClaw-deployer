@@ -12,13 +12,14 @@ It is tuned for a `t3.small` with a `16 GB` root volume:
 
 ## Why this shape
 
-OpenClaw's official install docs support Docker for isolated VPS-style deployments, and the security docs recommend treating one gateway host as one trust boundary. On a `t3.small`, building the project locally is still a bad fit for a tight `2 GB` RAM and `16 GB` disk budget, so this repo deploys a published image instead of compiling on the EC2 machine.
+OpenClaw's official install docs support Docker for isolated VPS-style deployments, and the security docs recommend treating one gateway host as one trust boundary. The official Docker flow builds a local image named `openclaw:local` from the OpenClaw source tree first; there is not a public `openclaw/openclaw:latest` image to pull. On a `t3.small`, building on the EC2 host is still a bad fit for a tight `2 GB` RAM and `16 GB` disk budget, so the practical next step is to build the image outside the instance and then deploy that built image.
 
 References:
 
 - [OpenClaw Docker install docs](https://docs.openclaw.ai/install/docker)
 - [OpenClaw install overview](https://docs.openclaw.ai/install)
 - [OpenClaw security guidance](https://docs.openclaw.ai/gateway/security)
+- [OpenClaw upstream docker-compose uses `openclaw:local`](https://github.com/openclaw/openclaw/blob/main/docker-compose.yml)
 
 ## Repo layout
 
@@ -66,7 +67,7 @@ Inputs:
 - `instance_type`: leave as `t3.small`
 - `volume_size`: leave as `16`
 - `ssh_user`: `ubuntu`
-- `openclaw_image`: default is `openclaw/openclaw:latest`
+- `openclaw_image`: use a real image you built and published yourself, or keep `openclaw:local` only if you load that image onto the host before deploy
 - `public_base_url`: leave blank unless you have your own HTTPS reverse proxy
 - `ami_id`: optional override
 
@@ -75,7 +76,22 @@ The workflow will:
 - create a new Ubuntu instance
 - install Docker with cloud-init
 - upload the compose file and env file
-- pull and start OpenClaw
+- try to start OpenClaw using the image name you provide
+
+## Important correction
+
+The first version of this scaffold used `openclaw/openclaw:latest`. That image does not currently exist publicly.
+
+The official OpenClaw Docker docs and the upstream compose file expect a locally built image:
+
+```bash
+docker build -t openclaw:local -f Dockerfile .
+```
+
+That means this deployment repo still needs one more step before it is production-ready:
+
+- either build OpenClaw from source in GitHub Actions and transfer the image to EC2
+- or publish your own image to a registry you control and set `openclaw_image` to that image
 
 ### 2. Access OpenClaw safely
 

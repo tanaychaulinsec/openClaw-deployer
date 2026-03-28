@@ -1,6 +1,6 @@
 services:
   openclaw:
-    image: ${OPENCLAW_IMAGE:-openclaw/openclaw:latest}
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
     container_name: openclaw
     restart: unless-stopped
     ports:
@@ -19,4 +19,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-

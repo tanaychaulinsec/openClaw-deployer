@@ -11,9 +11,9 @@ on:
         required: true
         default: ubuntu
       openclaw_image:
-        description: OpenClaw image to deploy
+        description: OpenClaw image to deploy if you built and published one yourself
         required: true
-        default: openclaw/openclaw:latest
+        default: openclaw:local
       public_base_url:
         description: Optional public HTTPS URL if you reverse proxy OpenClaw
         required: false
@@ -78,4 +78,3 @@ jobs:
           set -euo pipefail
           ssh -o StrictHostKeyChecking=no -i .tmp/id_rsa "${INPUT_SSH_USER}@${INPUT_HOST}" \
             "chmod +x /opt/openclaw/deploy-openclaw.sh /opt/openclaw/prune-host.sh && /opt/openclaw/deploy-openclaw.sh"
-
