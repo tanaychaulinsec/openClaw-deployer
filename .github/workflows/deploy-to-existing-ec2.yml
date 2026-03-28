@@ -1,0 +1,81 @@
+name: Deploy To Existing EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: Public IP or DNS of the EC2 host
+        required: true
+      ssh_user:
+        description: SSH user for the host
+        required: true
+        default: ubuntu
+      openclaw_image:
+        description: OpenClaw image to deploy
+        required: true
+        default: openclaw/openclaw:latest
+      public_base_url:
+        description: Optional public HTTPS URL if you reverse proxy OpenClaw
+        required: false
+        default: ""
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+      OPENCLAW_GATEWAY_PASSWORD: ${{ secrets.OPENCLAW_GATEWAY_PASSWORD }}
+      MODEL_BACKEND_URL: ${{ secrets.MODEL_BACKEND_URL }}
+      INPUT_HOST: ${{ github.event.inputs.host }}
+      INPUT_SSH_USER: ${{ github.event.inputs.ssh_user }}
+      INPUT_OPENCLAW_IMAGE: ${{ github.event.inputs.openclaw_image }}
+      INPUT_PUBLIC_BASE_URL: ${{ github.event.inputs.public_base_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          printf '%s\n' "${EC2_SSH_PRIVATE_KEY}" > .tmp/id_rsa
+          chmod 600 .tmp/id_rsa
+
+      - name: Render environment file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          base_url="${INPUT_PUBLIC_BASE_URL}"
+          if [[ -z "${base_url}" ]]; then
+            base_url="http://127.0.0.1:18789"
+          fi
+
+          {
+            printf 'OPENCLAW_IMAGE=%s\n' "${INPUT_OPENCLAW_IMAGE}"
+            printf 'OPENCLAW_PORT=18789\n'
+            printf 'TZ=%s\n' "UTC"
+            printf 'OPENCLAW_BASE_URL=%s\n' "${base_url}"
+            printf 'OPENCLAW_GATEWAY_PASSWORD=%s\n' "${OPENCLAW_GATEWAY_PASSWORD}"
+            printf 'MODEL_BACKEND_URL=%s\n' "${MODEL_BACKEND_URL}"
+          } > .tmp/openclaw.env
+
+      - name: Upload deployment bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=no -i .tmp/id_rsa "${INPUT_SSH_USER}@${INPUT_HOST}" "mkdir -p /opt/openclaw"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa docker/docker-compose.yml "${INPUT_SSH_USER}@${INPUT_HOST}:/opt/openclaw/docker-compose.yml"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa deploy/deploy-openclaw.sh "${INPUT_SSH_USER}@${INPUT_HOST}:/opt/openclaw/deploy-openclaw.sh"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa deploy/prune-host.sh "${INPUT_SSH_USER}@${INPUT_HOST}:/opt/openclaw/prune-host.sh"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa .tmp/openclaw.env "${INPUT_SSH_USER}@${INPUT_HOST}:/opt/openclaw/openclaw.env"
+
+      - name: Deploy OpenClaw
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=no -i .tmp/id_rsa "${INPUT_SSH_USER}@${INPUT_HOST}" \
+            "chmod +x /opt/openclaw/deploy-openclaw.sh /opt/openclaw/prune-host.sh && /opt/openclaw/deploy-openclaw.sh"
+

@@ -1,0 +1,70 @@
+name: Stop Or Terminate EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_name:
+        description: EC2 Name tag to manage
+        required: true
+        default: openclaw-ephemeral
+      action:
+        description: Stop keeps the EBS volume. Terminate deletes the instance.
+        required: true
+        type: choice
+        options:
+          - stop
+          - terminate
+
+jobs:
+  stop-or-terminate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      INPUT_INSTANCE_NAME: ${{ github.event.inputs.instance_name }}
+      INPUT_ACTION: ${{ github.event.inputs.action }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Find matching instances
+        id: instances
+        shell: bash
+        run: |
+          set -euo pipefail
+          instance_ids="$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${INPUT_INSTANCE_NAME}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)"
+
+          if [[ -z "${instance_ids}" || "${instance_ids}" == "None" ]]; then
+            echo "instance_ids=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "instance_ids=${instance_ids}" >> "${GITHUB_OUTPUT}"
+
+      - name: Nothing to do
+        if: steps.instances.outputs.instance_ids == ''
+        run: echo "No matching instances found."
+
+      - name: Stop instances
+        if: github.event.inputs.action == 'stop' && steps.instances.outputs.instance_ids != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ec2 stop-instances --instance-ids ${{ steps.instances.outputs.instance_ids }}
+          aws ec2 wait instance-stopped --instance-ids ${{ steps.instances.outputs.instance_ids }}
+
+      - name: Terminate instances
+        if: github.event.inputs.action == 'terminate' && steps.instances.outputs.instance_ids != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ec2 terminate-instances --instance-ids ${{ steps.instances.outputs.instance_ids }}
+          aws ec2 wait instance-terminated --instance-ids ${{ steps.instances.outputs.instance_ids }}
+

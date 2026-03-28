@@ -1,0 +1,178 @@
+name: Launch And Deploy OpenClaw
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_name:
+        description: EC2 Name tag
+        required: true
+        default: openclaw-ephemeral
+      instance_type:
+        description: EC2 instance type
+        required: true
+        default: t3.small
+      volume_size:
+        description: Root volume size in GB
+        required: true
+        default: "16"
+      ssh_user:
+        description: SSH user for the AMI
+        required: true
+        default: ubuntu
+      openclaw_image:
+        description: OpenClaw image to deploy
+        required: true
+        default: openclaw/openclaw:latest
+      public_base_url:
+        description: Optional public HTTPS URL if you reverse proxy OpenClaw
+        required: false
+        default: ""
+      ami_id:
+        description: Optional custom AMI ID. Leave blank to use Ubuntu 24.04 LTS.
+        required: false
+        default: ""
+
+jobs:
+  launch-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      EC2_SUBNET_ID: ${{ secrets.EC2_SUBNET_ID }}
+      EC2_SECURITY_GROUP_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+      EC2_KEY_PAIR_NAME: ${{ secrets.EC2_KEY_PAIR_NAME }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+      OPENCLAW_GATEWAY_PASSWORD: ${{ secrets.OPENCLAW_GATEWAY_PASSWORD }}
+      MODEL_BACKEND_URL: ${{ secrets.MODEL_BACKEND_URL }}
+      INPUT_AMI_ID: ${{ github.event.inputs.ami_id }}
+      INPUT_INSTANCE_NAME: ${{ github.event.inputs.instance_name }}
+      INPUT_INSTANCE_TYPE: ${{ github.event.inputs.instance_type }}
+      INPUT_VOLUME_SIZE: ${{ github.event.inputs.volume_size }}
+      INPUT_SSH_USER: ${{ github.event.inputs.ssh_user }}
+      INPUT_OPENCLAW_IMAGE: ${{ github.event.inputs.openclaw_image }}
+      INPUT_PUBLIC_BASE_URL: ${{ github.event.inputs.public_base_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Resolve AMI
+        id: ami
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_AMI_ID}" ]]; then
+            echo "ami_id=${INPUT_AMI_ID}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          ami_id="$(aws ssm get-parameter \
+            --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+            --query 'Parameter.Value' \
+            --output text)"
+          echo "ami_id=${ami_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Launch EC2 instance
+        id: launch
+        shell: bash
+        run: |
+          set -euo pipefail
+          instance_id="$(aws ec2 run-instances \
+            --image-id "${{ steps.ami.outputs.ami_id }}" \
+            --instance-type "${INPUT_INSTANCE_TYPE}" \
+            --key-name "${EC2_KEY_PAIR_NAME}" \
+            --security-group-ids "${EC2_SECURITY_GROUP_ID}" \
+            --subnet-id "${EC2_SUBNET_ID}" \
+            --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${INPUT_VOLUME_SIZE},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
+            --user-data "file://deploy/bootstrap-ec2.sh" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INPUT_INSTANCE_NAME}},{Key=App,Value=OpenClaw},{Key=Lifecycle,Value=ephemeral}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)"
+
+          echo "instance_id=${instance_id}" >> "${GITHUB_OUTPUT}"
+          aws ec2 wait instance-running --instance-ids "${instance_id}"
+          aws ec2 wait instance-status-ok --instance-ids "${instance_id}"
+
+      - name: Lookup public IP
+        id: host
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_ip="$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.launch.outputs.instance_id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)"
+          echo "public_ip=${public_ip}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          printf '%s\n' "${EC2_SSH_PRIVATE_KEY}" > .tmp/id_rsa
+          chmod 600 .tmp/id_rsa
+
+      - name: Wait for SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no -i .tmp/id_rsa "${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}" "echo ssh-ready" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "SSH did not become ready in time" >&2
+          exit 1
+
+      - name: Render environment file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          base_url="${INPUT_PUBLIC_BASE_URL}"
+          if [[ -z "${base_url}" ]]; then
+            base_url="http://127.0.0.1:18789"
+          fi
+
+          {
+            printf 'OPENCLAW_IMAGE=%s\n' "${INPUT_OPENCLAW_IMAGE}"
+            printf 'OPENCLAW_PORT=18789\n'
+            printf 'TZ=%s\n' "UTC"
+            printf 'OPENCLAW_BASE_URL=%s\n' "${base_url}"
+            printf 'OPENCLAW_GATEWAY_PASSWORD=%s\n' "${OPENCLAW_GATEWAY_PASSWORD}"
+            printf 'MODEL_BACKEND_URL=%s\n' "${MODEL_BACKEND_URL}"
+          } > .tmp/openclaw.env
+
+      - name: Upload deployment bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=no -i .tmp/id_rsa "${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}" "mkdir -p /opt/openclaw"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa docker/docker-compose.yml "${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}:/opt/openclaw/docker-compose.yml"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa deploy/deploy-openclaw.sh "${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}:/opt/openclaw/deploy-openclaw.sh"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa deploy/prune-host.sh "${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}:/opt/openclaw/prune-host.sh"
+          scp -o StrictHostKeyChecking=no -i .tmp/id_rsa .tmp/openclaw.env "${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}:/opt/openclaw/openclaw.env"
+
+      - name: Deploy OpenClaw
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=no -i .tmp/id_rsa "${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}" \
+            "chmod +x /opt/openclaw/deploy-openclaw.sh /opt/openclaw/prune-host.sh && /opt/openclaw/deploy-openclaw.sh"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## OpenClaw deployed"
+            echo
+            echo "- Instance ID: \`${{ steps.launch.outputs.instance_id }}\`"
+            echo "- Public IP: \`${{ steps.host.outputs.public_ip }}\`"
+            echo "- SSH tunnel: \`ssh -i <key> -L 18789:127.0.0.1:18789 ${INPUT_SSH_USER}@${{ steps.host.outputs.public_ip }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
